@@ -150,7 +150,7 @@ def write_json(path: Path, obj) -> Path | None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
         backup = path.with_name(f"{path.name}.bak-{stamp}")
         shutil.copy2(path, backup)
-    tmp = path.with_name(f".{path.name}.tmp")
+    tmp = path.with_name(f".{path.name}.tmp-{time.time_ns()}")
     with gzip.GzipFile(tmp, "wb", mtime=0) as gz:
         gz.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
     os.replace(tmp, path)
@@ -512,9 +512,10 @@ def recommend(generations: list, settings: dict) -> dict:
     gain = best[-1] - best[0]
     scale = max(1.0, abs(max(best)))
     evo = settings.get("Evolution") or {}
-    rate = float(evo.get("MutationRate") or 0.2)
-    size = int(evo.get("SelectionSize") or 3)
-    units = int(evo.get("UnitsCount") or 800)
+    # 0 是合法值，不能被默认值顶掉，否则爬山建议的基线就错了
+    rate = float(0.2 if evo.get("MutationRate") is None else evo["MutationRate"])
+    size = int(3 if evo.get("SelectionSize") is None else evo["SelectionSize"])
+    units = int(800 if evo.get("UnitsCount") is None else evo["UnitsCount"])
 
     if gain <= 0.01 * scale:
         new_rate = min(0.5, round(rate * 1.25, 4))
@@ -610,6 +611,16 @@ def _selftest() -> None:
 
         mutated = mutate_genome(json.loads(json.dumps(genome)), strength=1.0, rate=1.0, rng=random.Random(1))
         assert mutated["NeuralNetwork"]["Weights"][0][0][0] != 0.0
+        flat = [{"Generation": i + 1, "BestScore": 100.0} for i in range(6)]
+        zero = {"Evolution": {"MutationRate": 0.0, "SelectionSize": 0, "UnitsCount": 800}}
+        rec_zero = recommend(flat, zero)
+        # 0.0 也是合法基线：不该被默认值顶成 0.25
+        assert "Evolution.MutationRate" not in rec_zero["changes"], rec_zero
+        assert rec_zero["changes"].get("Evolution.SelectionSize") == 1, rec_zero
+        probe_path = evolution_dir(root) / "tmpcheck.evolution"
+        write_json(probe_path, {"Name": "tmpcheck"})
+        write_json(probe_path, {"Name": "tmpcheck2"})
+        assert not [p for p in probe_path.parent.iterdir() if ".tmp-" in p.name]
         print("selftest ok")
 
 

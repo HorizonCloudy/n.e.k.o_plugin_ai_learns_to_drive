@@ -1,7 +1,7 @@
 [plugin]
 id = "ai_learns_to_drive"
 name = "学车助手"
-description = "《AI Learns To Drive》陪玩插件：读取/修改进化超参数（变异率、选择压力、奖励权重、种群大小），检查神经网络基因组，按训练曲线给出下一步调参建议，并能在两次游戏运行之间自动落盘。只读写游戏自己的 gzip+JSON 存档，不注入进程、不模拟输入。每次写入前自动备份。"
+description = "《AI Learns To Drive》陪玩插件：读取/修改进化超参数（变异率、选择压力、奖励权重、种群大小），检查神经网络基因组，按训练曲线给出下一步调参建议，并能在两次游戏运行之间自动落盘。读写游戏自己的 gzip+JSON 存档，不注入进程；仅在调用 ald_run 时启动游戏，或把游戏窗口切到前台并发送 F5 / Shift+F5（可配置）。每次写入前自动备份。"
 short_description = "Companion for AI Learns To Drive: inspect genomes, tune evolution settings, closed-loop auto-tuning between runs."
 keywords = [
     "AI Learns To Drive",
@@ -40,15 +40,18 @@ user_dir = ""
 # 用来判断游戏是否在运行（运行时写设置会被游戏退出时覆盖，所以默认拒绝）。
 game_exe = "AI Learns To Drive.exe"
 
-# 游戏安装目录。留空 = 自动探测常见 Steam 路径（文件夹名是 AI Learns To Race）。
+# 游戏安装目录。留空 = 从 Steam 库（libraryfolders.vdf）自动探测（文件夹名是 AI Learns To Race）。
 game_dir = ""
 
 # 训练控制按键：toggle/start 发 run_key，stop 发 stop_key。
 run_key = "F5"
 stop_key = "Shift+F5"
 
-# 写盘总开关。关闭后所有修改类操作都会拒绝。
+# 写盘总开关。关闭后所有修改类操作（含自动巡航的退出后调参）都会拒绝。
 allow_write = true
+
+# 游戏验证：auto = 检测到游戏安装才开；on；off。开启时每次写设置 / 基因组后回读校验（结果带 verified / mismatched），launch 后确认进程出现（结果带 running）。
+verify_game = "auto"
 
 # 自动巡航：游戏退出后读取最新训练曲线，给出/应用下一步参数。
 autopilot_enabled = false

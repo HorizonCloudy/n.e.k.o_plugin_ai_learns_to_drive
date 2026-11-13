@@ -1,6 +1,6 @@
 """学车助手：把《AI Learns To Drive》的存档层能力交给 N.E.K.O.。
 
-只读/写游戏自己的 gzip+JSON 文件，不注入进程。
+读写游戏自己的 gzip+JSON 文件，不注入进程；ald_run 例外：会启动游戏或给游戏窗口发键。
 """
 
 from __future__ import annotations
@@ -59,16 +59,26 @@ class AiLearnsToDrivePlugin(NekoPluginBase):
     def _user_dir(self, cfg: dict) -> Path:
         return ald.resolve_user_dir(cfg)
 
+    @staticmethod
+    def _verify(cfg: dict) -> bool:
+        return ald.verify_enabled(cfg, ald.resolve_game_dir(cfg))
+
     # ------------------------------------------------------------------- ops
 
     async def _status(self) -> dict:
         cfg = await self._cfg()
         user = self._user_dir(cfg)
         exe = str(cfg.get("game_exe") or ald.GAME_EXE)
+        game = ald.resolve_game_dir(cfg)
         out: dict = {
+            "game_dir": str(game) if game else None,
+            "game_exe_present": bool(game and (game / exe).exists()),
+            "verify_game": str(cfg.get("verify_game", "auto")),
+            "verify": ald.verify_enabled(cfg, game),
             "user_dir": str(user),
             "settings_file": str(ald.settings_path(user)),
             "settings_exists": ald.settings_path(user).exists(),
+            "evolution_dir_exists": ald.evolution_dir(user).is_dir(),
             "game_running": ald.is_game_running(exe),
             "allow_write": bool(cfg.get("allow_write", True)),
             "autopilot": self._autopilot_status(cfg),
@@ -161,6 +171,9 @@ class AiLearnsToDrivePlugin(NekoPluginBase):
 
         backup = ald.save_settings(user, new_settings)
         result["backup"] = str(backup.parent / backup.name) if backup else None
+        if self._verify(cfg):
+            result["mismatched"] = ald.verify_applied(user, applied)
+            result["verified"] = not result["mismatched"]
         return result
 
     async def _genomes_op(
@@ -213,6 +226,8 @@ class AiLearnsToDrivePlugin(NekoPluginBase):
                 data["Name"] = f"{base}{suffix}"
                 out_path = ald.evolution_dir(user) / f"{data['Name']}.evolution"
                 ald.write_json(out_path, data)
+                if self._verify(cfg) and ald.read_json(out_path).get("Name") != data["Name"]:
+                    raise SdkError(f"回读校验失败：{out_path.name}")
                 made.append(out_path.name)
             return {"source": target.name, "created": made, "strength": strength, "rate": rate}
 
@@ -290,12 +305,16 @@ class AiLearnsToDrivePlugin(NekoPluginBase):
             "changes": rec.get("changes") or {},
             "applied": False,
         }
-        if decision["changes"] and bool(cfg.get("auto_apply_after_exit", True)):
+        if decision["changes"] and not bool(cfg.get("allow_write", True)):
+            decision["rejected"] = "allow_write=false"
+        elif decision["changes"] and bool(cfg.get("auto_apply_after_exit", True)):
             new_settings, applied, rejected = ald.apply_changes(settings, decision["changes"])
             if applied and not rejected:
                 ald.save_settings(user, new_settings)
                 decision["applied"] = True
                 decision["applied_changes"] = applied
+                if self._verify(cfg):
+                    decision["mismatched"] = ald.verify_applied(user, applied)
             else:
                 decision["rejected"] = rejected
 
@@ -325,7 +344,10 @@ class AiLearnsToDrivePlugin(NekoPluginBase):
             if not path.exists():
                 raise SdkError(f"找不到可执行文件：{path}")
             subprocess.Popen([str(path)], cwd=str(game_dir))
-            return {"launched": True, "path": str(path)}
+            out = {"launched": True, "path": str(path)}
+            if self._verify(cfg):
+                out["running"] = await asyncio.to_thread(ald.wait_for_pid, exe, 15.0)
+            return out
         if action in ("toggle", "start", "stop"):
             chosen = key or (cfg.get("stop_key", "Shift+F5") if action == "stop" else cfg.get("run_key", "F5"))
             return ald.send_keys(exe, chosen)

@@ -16,6 +16,7 @@ import io
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import time
@@ -23,11 +24,13 @@ from datetime import datetime
 from pathlib import Path
 
 GAME_EXE = "AI Learns To Drive.exe"
-STEAM_CANDIDATES = (
-    r"E:\Program Files (x86)\Steam\steamapps\common\AI Learns To Race",
-    r"C:\Program Files (x86)\Steam\steamapps\common\AI Learns To Race",
-    r"D:\SteamLibrary\steamapps\common\AI Learns To Race",
+# 没有 libraryfolders.vdf 时的兜底库根目录；有 vdf 就以 vdf 为准。
+STEAM_ROOTS = (
+    r"E:\Program Files (x86)\Steam",
+    r"C:\Program Files (x86)\Steam",
+    r"D:\SteamLibrary",
 )
+VDF_PATH_RE = re.compile(r'"path"\s+"([^"]+)"')
 
 # 只允许改这些字段：数值范围来自游戏设置界面与真实存档观察。
 FLOAT_BOUNDS = {
@@ -171,10 +174,47 @@ def resolve_game_dir(cfg: dict | None = None) -> Path | None:
     raw = str((cfg or {}).get("game_dir") or "").strip()
     if raw:
         return Path(raw)
-    for candidate in STEAM_CANDIDATES:
-        if (Path(candidate) / GAME_EXE).exists():
-            return Path(candidate)
+    for lib in steam_libraries():
+        path = lib / "steamapps" / "common" / "AI Learns To Race"
+        if (path / GAME_EXE).exists():
+            return path
     return None
+
+
+def vdf_library_paths(text: str) -> list[Path]:
+    """libraryfolders.vdf 里每个库的 "path"（反斜杠是转义过的）。"""
+    return [Path(raw.replace("\\\\", "\\")) for raw in VDF_PATH_RE.findall(text or "")]
+
+
+def steam_libraries() -> list[Path]:
+    """注册表 SteamPath + 兜底根目录，再展开各自 libraryfolders.vdf 里的库。"""
+    roots = [Path(r) for r in STEAM_ROOTS]
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
+            roots.insert(0, Path(winreg.QueryValueEx(key, "SteamPath")[0]))
+    except (ImportError, OSError):
+        pass
+    libs: list[Path] = []
+    for root in roots:
+        try:
+            text = (root / "steamapps" / "libraryfolders.vdf").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        for lib in [root, *vdf_library_paths(text)]:
+            if lib not in libs:
+                libs.append(lib)
+    return libs
+
+
+def verify_enabled(cfg: dict | None, game: Path | None) -> bool:
+    """verify_game：auto = 检测到游戏安装才开；on / off 强制开关。"""
+    mode = str((cfg or {}).get("verify_game", "auto")).strip().lower()
+    if mode == "auto":
+        exe = str((cfg or {}).get("game_exe") or GAME_EXE)
+        return bool(game and (Path(game) / exe).exists())
+    return mode in ("on", "true")
 
 
 def game_pid(exe: str = GAME_EXE) -> int | None:
@@ -194,6 +234,16 @@ def game_pid(exe: str = GAME_EXE) -> int | None:
             except (IndexError, ValueError):
                 return None
     return None
+
+
+def wait_for_pid(exe: str = GAME_EXE, timeout: float = 15.0) -> bool:
+    """启动后回读：timeout 秒内进程表里出现 exe 就算真的起来了。"""
+    deadline = time.monotonic() + timeout
+    while game_pid(exe) is None:
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.5)
+    return True
 
 
 _VK = {
@@ -287,6 +337,15 @@ def load_settings(user_dir: Path) -> dict:
 
 def save_settings(user_dir: Path, settings: dict) -> Path | None:
     return write_json(settings_path(user_dir), settings)
+
+
+def verify_applied(user_dir: Path, applied: dict) -> list[str]:
+    """回读设置文件，返回与 applied 不一致的键（空列表 = 回读通过）。"""
+    settings = load_settings(user_dir)
+    return [
+        dotted for dotted, value in applied.items()
+        if (settings.get(dotted.partition(".")[0]) or {}).get(dotted.partition(".")[2]) != value
+    ]
 
 
 def list_genomes(user_dir: Path) -> list[Path]:
@@ -530,6 +589,13 @@ def _selftest() -> None:
         backup = save_settings(root, new)
         assert backup and backup.exists()
         assert load_settings(root)["Evolution"]["MutationRate"] == 0.35
+        assert verify_applied(root, applied) == []
+        assert verify_applied(root, {"Evolution.MutationRate": 0.5}) == ["Evolution.MutationRate"]
+        vdf = '"libraryfolders"\n{\n\t"0"\n\t{\n\t\t"path"\t\t"E:\\\\Steam"\n\t}\n}\n'
+        assert vdf_library_paths(vdf) == [Path(r"E:\Steam")]
+        assert not verify_enabled({"verify_game": "off"}, root) and not verify_enabled({}, root)
+        (root / "custom.exe").write_bytes(b"")
+        assert verify_enabled({"game_exe": "custom.exe"}, root)
 
         genome = {
             "Stats": {"Generations": [{"BestScore": v} for v in (1.0, 1.1, 1.2, 1.25, 1.26)]},

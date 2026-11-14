@@ -319,6 +319,7 @@ class AiLearnsToDrivePlugin(NekoPluginBase):
             self._retry_count = 0
             return {"skipped": "这轮数据连续三次没处理成功，先跳过", "genome": genome_path.name}
 
+        blocked = ""
         try:
             genome = ald.read_json(genome_path)
             settings = ald.load_settings(user)
@@ -357,6 +358,14 @@ class AiLearnsToDrivePlugin(NekoPluginBase):
                 self._retry_genome_mtime = mtime
                 self._retry_count = 1
             raise
+        if blocked:
+            # 被闸门拦下按失败处理：不推进 mtime，下轮重试，连续三次后放弃
+            if mtime == self._retry_genome_mtime:
+                self._retry_count += 1
+            else:
+                self._retry_genome_mtime = mtime
+                self._retry_count = 1
+            return decision
         self._last_genome_mtime = mtime
         self._retry_genome_mtime = 0.0
         self._retry_count = 0

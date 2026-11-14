@@ -1,6 +1,6 @@
 """学车助手：把《AI Learns To Drive》的存档层能力交给 N.E.K.O.。
 
-只读/写游戏自己的 gzip+JSON 文件，不注入进程。
+读写游戏自己的 gzip+JSON 文件，不注入进程；ald_run 例外：会启动游戏或给游戏窗口发键。
 """
 
 from __future__ import annotations
@@ -33,6 +33,8 @@ class AiLearnsToDrivePlugin(NekoPluginBase):
         self._task: asyncio.Task | None = None
         self._stop = asyncio.Event()
         self._last_genome_mtime = 0.0
+        self._retry_genome_mtime = 0.0
+        self._retry_count = 0
         self._last_poll: str | None = None
         self._last_decision: dict | None = None
         self._last_error: str | None = None
@@ -59,16 +61,26 @@ class AiLearnsToDrivePlugin(NekoPluginBase):
     def _user_dir(self, cfg: dict) -> Path:
         return ald.resolve_user_dir(cfg)
 
+    @staticmethod
+    def _verify(cfg: dict) -> bool:
+        return ald.verify_enabled(cfg, ald.resolve_game_dir(cfg))
+
     # ------------------------------------------------------------------- ops
 
     async def _status(self) -> dict:
         cfg = await self._cfg()
         user = self._user_dir(cfg)
         exe = str(cfg.get("game_exe") or ald.GAME_EXE)
+        game = ald.resolve_game_dir(cfg)
         out: dict = {
+            "game_dir": str(game) if game else None,
+            "game_exe_present": bool(game and (game / exe).exists()),
+            "verify_game": str(cfg.get("verify_game", "auto")),
+            "verify": ald.verify_enabled(cfg, game),
             "user_dir": str(user),
             "settings_file": str(ald.settings_path(user)),
             "settings_exists": ald.settings_path(user).exists(),
+            "evolution_dir_exists": ald.evolution_dir(user).is_dir(),
             "game_running": ald.is_game_running(exe),
             "allow_write": bool(cfg.get("allow_write", True)),
             "autopilot": self._autopilot_status(cfg),
@@ -161,6 +173,9 @@ class AiLearnsToDrivePlugin(NekoPluginBase):
 
         backup = ald.save_settings(user, new_settings)
         result["backup"] = str(backup.parent / backup.name) if backup else None
+        if self._verify(cfg):
+            result["mismatched"] = ald.verify_applied(user, applied)
+            result["verified"] = not result["mismatched"]
         return result
 
     async def _genomes_op(
@@ -199,9 +214,9 @@ class AiLearnsToDrivePlugin(NekoPluginBase):
         if action == "mutate":
             if not bool(cfg.get("allow_write", True)):
                 raise SdkError("配置里 allow_write=false，已拒绝写盘")
-            strength = max(0.0, min(float(strength or 0.1), 1.0))
-            rate = max(0.0, min(float(rate or 0.1), 1.0))
-            copies = max(1, min(int(copies or 1), 10))
+            strength = max(0.0, min(float(0.1 if strength is None else strength), 1.0))
+            rate = max(0.0, min(float(0.1 if rate is None else rate), 1.0))
+            copies = max(1, min(int(1 if copies is None else copies), 10))
             made = []
             stamp = ald.datetime.now().strftime("%Y%m%d-%H%M%S")
             for i in range(copies):
@@ -213,6 +228,8 @@ class AiLearnsToDrivePlugin(NekoPluginBase):
                 data["Name"] = f"{base}{suffix}"
                 out_path = ald.evolution_dir(user) / f"{data['Name']}.evolution"
                 ald.write_json(out_path, data)
+                if self._verify(cfg) and ald.read_json(out_path).get("Name") != data["Name"]:
+                    raise SdkError(f"回读校验失败：{out_path.name}")
                 made.append(out_path.name)
             return {"source": target.name, "created": made, "strength": strength, "rate": rate}
 
@@ -240,14 +257,23 @@ class AiLearnsToDrivePlugin(NekoPluginBase):
             return self._autopilot_status(cfg)
         if action == "stop":
             self._stop.set()
-            if self._task:
-                try:
-                    await asyncio.wait_for(self._task, timeout=5)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    pass
-            self._task = None
+            await self._stop_loop_task()
             return self._autopilot_status(cfg)
         return self._autopilot_status(cfg)
+
+    async def _stop_loop_task(self) -> None:
+        """等循环退出；超时就 cancel。不然再 start 会出现两个循环重复写盘。"""
+        task = self._task
+        if task and not task.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._task = None
 
     async def _autopilot_loop(self) -> None:
         cfg = await self._cfg()
@@ -270,6 +296,15 @@ class AiLearnsToDrivePlugin(NekoPluginBase):
             except asyncio.TimeoutError:
                 pass
 
+    def _cruise_write_block(self, cfg: dict) -> str:
+        """巡航写设置的闸门。空串表示可以写，否则是拒绝原因。"""
+        if not bool(cfg.get("allow_write", True)):
+            return "配置里 allow_write=false，已拒绝写盘"
+        exe = str(cfg.get("game_exe") or ald.GAME_EXE)
+        if ald.is_game_running(exe):
+            return "游戏又打开了；等它退出后巡航才会改设置"
+        return ""
+
     async def _after_game_exit(self, cfg: dict) -> dict:
         user = self._user_dir(cfg)
         genome_path = ald.newest_genome(user)
@@ -278,31 +313,62 @@ class AiLearnsToDrivePlugin(NekoPluginBase):
         mtime = genome_path.stat().st_mtime
         if mtime <= self._last_genome_mtime:
             return {"skipped": "本次没有新的训练数据", "genome": genome_path.name}
-        self._last_genome_mtime = mtime
+        if mtime == self._retry_genome_mtime and self._retry_count >= 3:
+            self._last_genome_mtime = mtime
+            self._retry_genome_mtime = 0.0
+            self._retry_count = 0
+            return {"skipped": "这轮数据连续三次没处理成功，先跳过", "genome": genome_path.name}
 
-        genome = ald.read_json(genome_path)
-        settings = ald.load_settings(user)
-        rec = ald.recommend((genome.get("Stats") or {}).get("Generations") or [], settings)
-        decision = {
-            "time": ald.now_iso(),
-            "genome": genome_path.name,
-            "reason": rec.get("reason"),
-            "changes": rec.get("changes") or {},
-            "applied": False,
-        }
-        if decision["changes"] and bool(cfg.get("auto_apply_after_exit", True)):
-            new_settings, applied, rejected = ald.apply_changes(settings, decision["changes"])
-            if applied and not rejected:
-                ald.save_settings(user, new_settings)
-                decision["applied"] = True
-                decision["applied_changes"] = applied
+        blocked = ""
+        try:
+            genome = ald.read_json(genome_path)
+            settings = ald.load_settings(user)
+            rec = ald.recommend((genome.get("Stats") or {}).get("Generations") or [], settings)
+            decision = {
+                "time": ald.now_iso(),
+                "genome": genome_path.name,
+                "reason": rec.get("reason"),
+                "changes": rec.get("changes") or {},
+                "applied": False,
+            }
+            if decision["changes"] and bool(cfg.get("auto_apply_after_exit", True)):
+                blocked = self._cruise_write_block(cfg)
+                if blocked:
+                    decision["skipped"] = blocked
+                else:
+                    new_settings, applied, rejected = ald.apply_changes(settings, decision["changes"])
+                    if applied and not rejected:
+                        ald.save_settings(user, new_settings)
+                        decision["applied"] = True
+                        decision["applied_changes"] = applied
+                        if self._verify(cfg):
+                            decision["mismatched"] = ald.verify_applied(user, applied)
+                    else:
+                        decision["rejected"] = rejected
+
+            log = self._data_file("autopilot.jsonl")
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with log.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(decision, ensure_ascii=False) + "\n")
+        except Exception:
+            # 写失败不推进 mtime，下一轮轮询会重试，最多三次
+            if mtime == self._retry_genome_mtime:
+                self._retry_count += 1
             else:
-                decision["rejected"] = rejected
-
-        log = self._data_file("autopilot.jsonl")
-        log.parent.mkdir(parents=True, exist_ok=True)
-        with log.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(decision, ensure_ascii=False) + "\n")
+                self._retry_genome_mtime = mtime
+                self._retry_count = 1
+            raise
+        if blocked:
+            # 被闸门拦下按失败处理：不推进 mtime，下轮重试，连续三次后放弃
+            if mtime == self._retry_genome_mtime:
+                self._retry_count += 1
+            else:
+                self._retry_genome_mtime = mtime
+                self._retry_count = 1
+            return decision
+        self._last_genome_mtime = mtime
+        self._retry_genome_mtime = 0.0
+        self._retry_count = 0
         return decision
 
     async def _run_op(self, action: str = "status", key: str = "") -> dict:
@@ -325,7 +391,10 @@ class AiLearnsToDrivePlugin(NekoPluginBase):
             if not path.exists():
                 raise SdkError(f"找不到可执行文件：{path}")
             subprocess.Popen([str(path)], cwd=str(game_dir))
-            return {"launched": True, "path": str(path)}
+            out = {"launched": True, "path": str(path)}
+            if self._verify(cfg):
+                out["running"] = await asyncio.to_thread(ald.wait_for_pid, exe, 15.0)
+            return out
         if action in ("toggle", "start", "stop"):
             chosen = key or (cfg.get("stop_key", "Shift+F5") if action == "stop" else cfg.get("run_key", "F5"))
             return ald.send_keys(exe, chosen)
@@ -516,9 +585,5 @@ class AiLearnsToDrivePlugin(NekoPluginBase):
     async def on_shutdown(self, **_):
         if self._task and not self._task.done():
             self._stop.set()
-            try:
-                await asyncio.wait_for(self._task, timeout=5)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                pass
-            self._task = None
+            await self._stop_loop_task()
         return Ok({"status": "stopped"})
